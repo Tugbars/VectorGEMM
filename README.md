@@ -429,7 +429,7 @@ If you use this code in research, please cite:
   title = {Safety-Hardened GEMM Implementation},
   author = {TUGBARS},
   year = {2025},
-  note = {Achieving 169.8 GFLOPS on Intel i9-14900}
+  note = {tuned for 14900K}
 }
 ```
 
@@ -440,6 +440,7 @@ If you use this code in research, please cite:
 ---
 
 *Benchmarked on Intel i9-14900, single-threaded. Performance may vary based on CPU architecture, memory bandwidth, and compiler optimizations.*
+
 
 
 
