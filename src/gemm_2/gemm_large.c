@@ -740,7 +740,7 @@ int gemm_execute_plan(
                     size_t mh = MIN(plan->MR, plan->M - i);
 
                     // Determine packing MR (8 or 16)
-                    size_t pack_mr = (mh >= 16) ? 16 : 8;
+                    size_t pack_mr = plan->MR;
 
                     //----------------------------------------------------------
                     // Pack A with alpha scaling (per MC tile)
@@ -1153,4 +1153,5 @@ b_strides.b_k_stride // same for every panel, so fine
 That’s logically correct, but a bit misleading: you could just call pack_B_panel_simd once, return the stride, and use the known B_STRIDE constant everywhere. Not a correctness problem, just clarity.
 
 */
+
 
