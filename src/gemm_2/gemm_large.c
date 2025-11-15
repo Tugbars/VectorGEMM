@@ -212,13 +212,14 @@ static pack_strides_t pack_A_panel_simd(
 {
     (void)M;
 
-    // ⚠️ BUG: Should be actual_mr = requested_mr to avoid buffer overflow
-    // Current logic can set actual_mr=8 even when ib=12, causing OOB writes
-    size_t actual_mr = (ib >= 16) ? 16 : 8;
-    assert(requested_mr == actual_mr && "MR mismatch: planning error");
+    size_t actual_mr = requested_mr;
+    assert(ib <= actual_mr && "ib exceeds MR: planning error");
 
-    // Zero entire buffer (safety: ensures unused rows are zero)
-    memset(Ap, 0, kb * actual_mr * sizeof(float));
+    // ✅ OPTIMIZATION: Only zero if we have unused rows
+    if (ib < actual_mr)
+    {
+        memset(Ap, 0, kb * actual_mr * sizeof(float));
+    }
 
     //--------------------------------------------------------------------------
     // Fast path: alpha = 1.0 (no scaling needed)
@@ -227,7 +228,6 @@ static pack_strides_t pack_A_panel_simd(
     {
         for (size_t k = 0; k < kb; ++k)
         {
-            // Prefetch future K-iteration
             if (k + 8 < kb)
             {
                 PREFETCH_T0(A + i0 * K + (k0 + k + 8));
@@ -249,13 +249,15 @@ static pack_strides_t pack_A_panel_simd(
             }
 
             // Scalar tail: Remaining rows
-            // ⚠️ POTENTIAL BUG: If ib > actual_mr, this writes out of bounds!
             const float *src_tail = A + (i0 + i) * K + (k0 + k);
             for (; i < ib; ++i)
             {
                 dst[i] = src_tail[0];
                 src_tail += K;
             }
+            // ✅ Rows [ib .. actual_mr-1] are either:
+            //    - Already zeroed (if ib < actual_mr, via memset above)
+            //    - Don't exist (if ib == actual_mr)
         }
     }
     //--------------------------------------------------------------------------
@@ -288,7 +290,6 @@ static pack_strides_t pack_A_panel_simd(
             }
 
             // Scalar tail with scaling
-            // ⚠️ POTENTIAL BUG: If ib > actual_mr, this writes out of bounds!
             const float *src_tail = A + (i0 + i) * K + (k0 + k);
             for (; i < ib; ++i)
             {
@@ -300,7 +301,7 @@ static pack_strides_t pack_A_panel_simd(
 
     pack_strides_t strides;
     strides.a_k_stride = actual_mr;
-    strides.b_k_stride = 0; // Not used (only a_k_stride is relevant)
+    strides.b_k_stride = 0;
     return strides;
 }
 
@@ -361,14 +362,16 @@ static pack_strides_t pack_B_panel_simd(
 {
     (void)K;
 
-    const size_t B_STRIDE = 16; // Fixed stride (matches kernel expectations)
+    const size_t B_STRIDE = 16;
 
-    // Zero entire buffer (ensures unused columns are zero for edge tiles)
-    memset(Bp, 0, kb * B_STRIDE * sizeof(float));
+    // ✅ OPTIMIZATION: Only zero if we have unused columns
+    if (jb < B_STRIDE)
+    {
+        memset(Bp, 0, kb * B_STRIDE * sizeof(float));
+    }
 
     for (size_t k = 0; k < kb; ++k)
     {
-        // Prefetch future K-iteration
         if (k + 4 < kb)
         {
             PREFETCH_T0(B + (k0 + k + 4) * N + j0);
@@ -379,7 +382,7 @@ static pack_strides_t pack_B_panel_simd(
 
         size_t j = 0;
 
-        // SIMD copy: 8 elements at once
+        // SIMD copy: 8 columns at once
         for (; j + 7 < jb; j += 8)
         {
             __m256 v = _mm256_loadu_ps(src_row + j);
@@ -391,10 +394,13 @@ static pack_strides_t pack_B_panel_simd(
         {
             dst[j] = src_row[j];
         }
+        // ✅ Columns [jb .. B_STRIDE-1] are either:
+        //    - Already zeroed (if jb < B_STRIDE, via memset above)
+        //    - Don't exist (if jb == B_STRIDE)
     }
 
     pack_strides_t strides;
-    strides.a_k_stride = 0; // Not used (only b_k_stride is relevant)
+    strides.a_k_stride = 0;
     strides.b_k_stride = B_STRIDE;
     return strides;
 }
@@ -1147,3 +1153,4 @@ b_strides.b_k_stride // same for every panel, so fine
 That’s logically correct, but a bit misleading: you could just call pack_B_panel_simd once, return the stride, and use the known B_STRIDE constant everywhere. Not a correctness problem, just clarity.
 
 */
+
