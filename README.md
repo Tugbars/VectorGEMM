@@ -6,7 +6,6 @@ A production-ready, safety-first GEMM (General Matrix Multiply) implementation a
 
 **Intel i9-14900 (Single Core)**
 ```
-=== Large: 1024x1024x1024 (3 runs) ===
   Naive:     2036.722 ms  (1.1 GFLOPS)
   Optimized:  12.495 ms  (171.9 GFLOPS)
   Speedup:   163.00x faster
@@ -441,6 +440,7 @@ If you use this code in research, please cite:
 ---
 
 *Benchmarked on Intel i9-14900, single-threaded. Performance may vary based on CPU architecture, memory bandwidth, and compiler optimizations.*
+
 
 
 
