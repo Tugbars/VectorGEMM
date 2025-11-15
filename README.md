@@ -1,6 +1,6 @@
 # VectorGEMM: Safety-Hardened Matrix Multiplication
 
-A production-ready, safety-first GEMM (General Matrix Multiply) implementation achieving **169.8 GFLOPS** on Intel i9-14900 (single-core), with a **162× speedup** over naive implementations. Designed for embedded systems, numerical computing, and performance-critical applications where reliability matters as much as speed.
+A production-ready, safety-first GEMM (General Matrix Multiply) implementation achieving **171.9 GFLOPS** on Intel i9-14900 (single-core), with a **162× speedup** over naive implementations. Designed for embedded systems, numerical computing, and performance-critical applications where reliability matters as much as speed.
 
 ## Performance
 
@@ -441,5 +441,6 @@ If you use this code in research, please cite:
 ---
 
 *Benchmarked on Intel i9-14900, single-threaded. Performance may vary based on CPU architecture, memory bandwidth, and compiler optimizations.*
+
 
 
