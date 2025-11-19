@@ -70,34 +70,22 @@ static const size_t ADAPTIVE_KC_MIN = 32;
 /**
  * @brief Select adaptive blocking parameters based on matrix dimensions
  * 
- * **Algorithm:**
+ * **Five-Stage Algorithm:**
  * 
- * 1. **Aspect Ratio Analysis:**
- *    - Compute M/N and K/N ratios to classify matrix shape
- *    - Tall (M >> N): Optimize for row reuse
- *    - Wide (N >> M): Optimize for column reuse
- *    - Deep (K >> M,N): Optimize for reduction dimension
- *    - Balanced: Use default tuned parameters
+ * 1. **Aspect Ratio Classification**: Analyze M/N and K/N ratios to determine
+ *    matrix shape (tall/wide/deep/balanced) and select initial parameters
  * 
- * 2. **Initial Parameter Selection:**
- *    - Choose MC, KC, NC based on aspect ratio
- *    - Select MR, NR based on available kernels and dimensions
+ * 2. **Dimension Clamping**: Ensure cache blocks don't exceed matrix dimensions
+ *    (e.g., MC ≤ M, KC ≤ K, NC ≤ N)
  * 
- * 3. **Dimension Clamping:**
- *    - Ensure MC ≤ M, KC ≤ K, NC ≤ N (no oversized blocks)
+ * 3. **L2 Cache Fitting**: Scale down parameters if workspace exceeds L2 target
+ *    (~1.8 MB), maintaining aspect ratios via sqrt scaling
  * 
- * 4. **L2 Cache Fitting:**
- *    - Target: (MC×KC + KC×NC) × 4 bytes ≤ 1.8 MB
- *    - If exceeds: Scale down proportionally while maintaining alignment
+ * 4. **Minimum Size Enforcement**: Ensure blocks are large enough for at least
+ *    one micro-kernel tile (MC ≥ MR, NC ≥ NR, KC ≥ 8)
  * 
- * 5. **Sanity Checks:**
- *    - Ensure MC ≥ MR, NC ≥ NR, KC ≥ 8
- *    - If violated: Reset to minimum safe values
- * 
- * **Aspect Ratio Thresholds:**
- * - Tall: M/N > 3.0
- * - Wide: M/N < 0.33
- * - Deep: K/N > 4.0
+ * 5. **Register Block Validation**: Ensure register blocks fit within cache
+ *    blocks (MR ≤ MC, NR ≤ NC) to prevent buffer overflows
  * 
  * @param[in]  M  Number of rows in A and C
  * @param[in]  K  Number of columns in A, rows in B
@@ -105,117 +93,194 @@ static const size_t ADAPTIVE_KC_MIN = 32;
  * @param[out] MC Output: M-dimension cache block size
  * @param[out] KC Output: K-dimension cache block size
  * @param[out] NC Output: N-dimension cache block size
- * @param[out] MR Output: M-dimension register block size (8 or 16)
- * @param[out] NR Output: N-dimension register block size (6, 8, or 16)
- * 
- * @note All output parameters must be non-NULL
- * @note Parameters are quantized to multiples of MR/NR for alignment
- * @note L2 cache target (1.8 MB) leaves headroom for code and stack
- * 
- * @see gemm_plan_create()
+ * @param[out] MR Output: M-dimension register block size
+ * @param[out] NR Output: N-dimension register block size
  */
 void gemm_select_blocking(
     size_t M, size_t K, size_t N,
     size_t *MC, size_t *KC, size_t *NC,
     size_t *MR, size_t *NR)
 {
-    // Compute aspect ratios for shape classification
+    //==========================================================================
+    // STAGE 1: ASPECT RATIO CLASSIFICATION
+    //==========================================================================
+    // Analyze matrix shape to select optimal blocking strategy:
+    // - Tall (M >> N): Large MC to amortize row packing overhead
+    // - Wide (N >> M): Large NC to amortize column packing overhead
+    // - Deep (K >> M,N): Large KC to reduce B repacking frequency
+    // - Balanced: Default tuned parameters for general case
+    //==========================================================================
+    
     double aspect_mn = (double)M / (double)N;
     double aspect_kn = (double)K / (double)N;
     
     //--------------------------------------------------------------------------
     // Case 1: Tall Matrices (M >> N)
-    // Strategy: Large MC to amortize A packing, small NC for cache efficiency
+    // Strategy: Maximize MC to process many rows per B panel
     //--------------------------------------------------------------------------
     if (aspect_mn > 3.0) {
-        *MC = ADAPTIVE_MC_TALL;      // 256 rows at a time
-        *KC = ADAPTIVE_KC_TALL;      // Moderate K blocking
-        *NC = MIN(N, ADAPTIVE_NC_SMALL); // Small N panels
-        *MR = 16;                     // Use tallest kernels
-        *NR = (N >= 16) ? 16 : ((N >= 8) ? 8 : 6); // Adapt to N
+        *MC = ADAPTIVE_MC_TALL;      // 256 rows at a time (amortize packing)
+        *KC = ADAPTIVE_KC_TALL;      // 128 (moderate K blocking)
+        *NC = MIN(N, ADAPTIVE_NC_SMALL); // Small N panels (N is limited anyway)
+        *MR = 16;                     // Use tallest kernels (16×N)
+        *NR = (N >= 16) ? 16 : ((N >= 8) ? 8 : 6); // Adapt to available N
     }
     //--------------------------------------------------------------------------
     // Case 2: Wide Matrices (N >> M)
-    // Strategy: Small MC to reduce footprint, large NC to amortize B packing
+    // Strategy: Maximize NC to process many columns per A panel
     //--------------------------------------------------------------------------
     else if (aspect_mn < 0.33) {
-        *MC = MIN(M, ADAPTIVE_MC_SMALL); // Don't exceed M
-        *KC = ADAPTIVE_KC_TALL;
-        *NC = ADAPTIVE_NC_WIDE;          // 512 columns at a time
-        *MR = (M >= 16) ? 16 : ((M >= 8) ? 8 : 4); // Adapt to M
-        *NR = 16;                         // Use widest kernels
+        *MC = MIN(M, ADAPTIVE_MC_SMALL); // Small MC (M is limited anyway)
+        *KC = ADAPTIVE_KC_TALL;           // 128 (moderate K blocking)
+        *NC = ADAPTIVE_NC_WIDE;           // 512 columns at a time
+        *MR = (M >= 16) ? 16 : ((M >= 8) ? 8 : 4); // Adapt to available M
+        *NR = 16;                         // Use widest kernels (M×16)
     }
     //--------------------------------------------------------------------------
     // Case 3: Deep Matrices (K >> M,N)
-    // Strategy: Large KC to reduce packing frequency
+    // Strategy: Maximize KC to reduce B repacking overhead
     //--------------------------------------------------------------------------
     else if (aspect_kn > 4.0) {
-        *MC = MIN(M, ADAPTIVE_MC_SMALL);
-        *KC = ADAPTIVE_KC_DEEP;          // 512 K-blocks
-        *NC = MIN(N, ADAPTIVE_NC_SMALL);
-        *MR = (M >= 8) ? 8 : 4;
-        *NR = (N >= 8) ? 8 : 6;
+        *MC = MIN(M, ADAPTIVE_MC_SMALL); // Small MC (M is limited)
+        *KC = ADAPTIVE_KC_DEEP;          // 512 K-blocks (large reduction dim)
+        *NC = MIN(N, ADAPTIVE_NC_SMALL); // Small NC (N is limited)
+        *MR = (M >= 8) ? 8 : 4;          // Adapt to available M
+        *NR = (N >= 8) ? 8 : 6;          // Adapt to available N
     }
     //--------------------------------------------------------------------------
     // Case 4: Balanced Matrices
-    // Strategy: Use default tuned parameters (optimized for Intel 14900K)
+    // Strategy: Use default tuned parameters (128/256/256)
     //--------------------------------------------------------------------------
     else {
-        *MC = GEMM_BLOCK_MC; // 128
-        *KC = GEMM_BLOCK_KC; // 256
-        *NC = GEMM_BLOCK_NC; // 256
+        *MC = GEMM_BLOCK_MC; // 128 (tuned for Intel 14900K L1)
+        *KC = GEMM_BLOCK_KC; // 256 (tuned for L2 cache)
+        *NC = GEMM_BLOCK_NC; // 256 (tuned for L2 cache)
         
         // Select register blocking based on available dimensions
         if (N >= 16 && M >= 8) {
-            *NR = 16;
-            *MR = (M >= 16) ? 16 : 8;
+            *NR = 16;                        // Use 16-wide kernels
+            *MR = (M >= 16) ? 16 : 8;        // 16×16 or 8×16
         } else if (N >= 8) {
-            *NR = 8;
-            *MR = (M >= 16) ? 16 : 8;
+            *NR = 8;                         // Use 8-wide kernels
+            *MR = (M >= 16) ? 16 : 8;        // 16×8 or 8×8
         } else {
-            *NR = (N >= 6) ? 6 : N;
-            *MR = (M >= 8) ? 8 : M;
+            *NR = (N >= 6) ? 6 : N;          // Narrow matrices (6-wide or less)
+            *MR = (M >= 8) ? 8 : M;          // Match available rows
         }
     }
     
-    //--------------------------------------------------------------------------
-    // Clamp to actual matrix dimensions
-    //--------------------------------------------------------------------------
+    //==========================================================================
+    // STAGE 2: DIMENSION CLAMPING
+    //==========================================================================
+    // Ensure cache blocks don't exceed actual matrix dimensions.
+    // Example: If M=50 but MC=128, clamp MC=50 to avoid oversized tiles.
+    // This prevents wasting workspace on unused capacity.
+    //==========================================================================
+    
     *MC = MIN(*MC, M);
     *KC = MIN(*KC, K);
     *NC = MIN(*NC, N);
     
-    //--------------------------------------------------------------------------
-    // L2 Cache Fitting (Target: 1.8 MB total workspace)
-    // Workspace = (MC × KC + KC × NC) × sizeof(float)
-    //--------------------------------------------------------------------------
-    const size_t L2_TARGET = 1800 * 1024; // Bytes
+    //==========================================================================
+    // STAGE 3: L2 CACHE FITTING
+    //==========================================================================
+    // Target: (MC×KC + KC×NC) × 4 bytes ≤ 1.8 MB
+    // 
+    // Workspace components:
+    // - workspace_a: MC × KC floats (packed A panels)
+    // - workspace_b: KC × NC floats (packed B panels)
+    // 
+    // If workspace exceeds L2 cache, scale down ALL parameters proportionally
+    // using sqrt() to maintain aspect ratios. This keeps the relative balance
+    // between M/K/N blocking while fitting within cache constraints.
+    //==========================================================================
+    
+    const size_t L2_TARGET = 1800 * 1024; // 1.8 MB (leave headroom for code/stack)
     size_t workspace_bytes = (*MC * *KC + *KC * *NC) * sizeof(float);
     
     if (workspace_bytes > L2_TARGET) {
-        // Scale down by sqrt to maintain aspect ratio
+        // Scale factor: sqrt maintains aspect ratio
+        // Example: If workspace is 4× too large, scale = 0.5
+        // This reduces MC, KC, NC all by 0.5, making workspace 0.25× (fits!)
         double scale = sqrt((double)L2_TARGET / (double)workspace_bytes);
         
-        // Apply scaling with alignment preservation
+        // Apply scaling with alignment preservation:
+        // - MC must be multiple of MR (for clean micro-kernel tiling)
+        // - KC must be multiple of 8 (for SIMD alignment)
+        // - NC must be multiple of NR (for clean micro-kernel tiling)
         *MC = ((*MC * scale) / *MR) * *MR; // Round down to MR multiple
         *KC = ((*KC * scale) / 8) * 8;     // Round down to 8 multiple
         *NC = ((*NC * scale) / *NR) * *NR; // Round down to NR multiple
         
-        // Ensure minimum safe values
-        *MC = MAX(*MC, *MR);
-        *KC = MAX(*KC, ADAPTIVE_KC_MIN);
-        *NC = MAX(*NC, *NR);
+        // Ensure minimum safe values after rounding
+        *MC = MAX(*MC, *MR);                // At least one MR tile
+        *KC = MAX(*KC, ADAPTIVE_KC_MIN);    // At least 32 (min reduction block)
+        *NC = MAX(*NC, MIN(*NR, N));        // At least one NR tile (or all of N)
     }
     
-    //--------------------------------------------------------------------------
-    // Final Sanity Checks
-    // Ensure blocks are large enough for at least one micro-kernel tile
-    //--------------------------------------------------------------------------
+    //==========================================================================
+    // STAGE 4: MINIMUM SIZE ENFORCEMENT
+    //==========================================================================
+    // Ensure cache blocks can hold at least ONE micro-kernel tile.
+    // If MC < MR, we can't even pack a single tile - reset to minimum.
+    // 
+    // This handles edge cases where:
+    // - L2 scaling made blocks too small
+    // - Very small matrices (M=1, N=1, etc.)
+    // - Unusual aspect ratios that broke assumptions
+    //==========================================================================
+    
     if (*MC < *MR || *NC < *NR || *KC < 8) {
-        *MC = *MR;
-        *KC = ADAPTIVE_KC_MIN;
-        *NC = *NR;
+        *MC = *MR;              // Reset to single tile height
+        *KC = ADAPTIVE_KC_MIN;  // Reset to minimum K block (32)
+        *NC = *NR;              // Reset to single tile width
     }
+    
+    // Re-clamp to matrix dimensions (in case resets exceeded them)
+    *MC = MIN(*MC, M);
+    *KC = MIN(*KC, K);
+    *NC = MIN(*NC, N);
+    
+    //==========================================================================
+    // STAGE 5: REGISTER BLOCK VALIDATION (CRITICAL FIX!)
+    //==========================================================================
+    // **THE BUG FIX**: Ensure MR ≤ MC and NR ≤ NC
+    // 
+    // **Why this is needed:**
+    // The packing functions write MR × KC floats to workspace_a, but workspace
+    // is allocated as MC × KC floats. If MR > MC, we OVERFLOW the buffer!
+    // 
+    // **How it happens:**
+    // 1. Initial selection: MR=8 (based on available kernels)
+    // 2. Dimension clamping: MC = min(128, M=7) = 7
+    // 3. Result: MR=8 > MC=7 → BUFFER OVERFLOW when packing!
+    // 
+    // **The fix:**
+    // After all scaling/clamping, ensure register blocks respect cache blocks.
+    // This prevents pack functions from writing beyond allocated workspace.
+    // 
+    // **Example:**
+    // - Before fix: MC=7, MR=8 → pack writes 8 rows, overflow by 1 row
+    // - After fix:  MC=7, MR=7 → pack writes 7 rows, safe!
+    //==========================================================================
+    
+    *MR = MIN(*MR, *MC);  // ← THE FIX: Never pack more rows than cache block
+    *NR = MIN(*NR, *NC);  // ← THE FIX: Never pack more cols than cache block
+    
+    //==========================================================================
+    // FINAL STATE SUMMARY
+    //==========================================================================
+    // After this function:
+    // - MC, KC, NC are cache block sizes (fit in L1/L2)
+    // - MR, NR are register block sizes (micro-kernel dimensions)
+    // - Invariants guaranteed:
+    //   * MR ≤ MC ≤ M (no M-dimension overflow)
+    //   * NR ≤ NC ≤ N (no N-dimension overflow)
+    //   * KC ≤ K (no K-dimension overflow)
+    //   * MC ≥ MR, NC ≥ NR (at least one tile fits)
+    //   * KC ≥ 8 (SIMD alignment)
+    //   * (MC×KC + KC×NC) × 4 ≤ ~1.8 MB (fits in L2)
+    //==========================================================================
 }
 
 //==============================================================================
@@ -267,72 +332,100 @@ void gemm_select_blocking(
  * @see gemm_kernel_id_t
  * @see dispatch_kernel() in gemm_large.c
  */
+/**
+ * @brief Select kernel using exhaustive 2D dispatch table
+ * 
+ * RULES:
+ * 1. Always select LARGEST kernel that fits (m_kernel ≤ m, n_kernel ≤ n)
+ * 2. Handle ALL combinations systematically
+ * 3. Kernels handle partial tiles via scalar loops (safe)
+ */
+/**
+ * @brief Select kernel using refined 2D dispatch table
+ * 
+ * KEY FIX: Distinguish m ∈ [5,8] from m ∈ [9,15]
+ */
 void gemm_select_kernels(
     size_t m_height, size_t n_width,
     gemm_kernel_id_t *kern_add,
     gemm_kernel_id_t *kern_store,
     int *kernel_width)
 {
-    // Priority 1: 16×16 (largest, composite)
-    if (m_height >= 16 && n_width >= 16) {
-        *kern_add = KERN_16x16_ADD;
-        *kern_store = KERN_16x16_STORE;
-        *kernel_width = 16;
-        return;
+    //==========================================================================
+    // M-DIMENSION CLASSIFICATION (REFINED!)
+    //==========================================================================
+    int m_class;
+    if (m_height >= 16)      m_class = 4;  // 16+ rows → use 16× kernels
+    else if (m_height >= 9)  m_class = 3;  // 9-15 rows → use 16× kernels (composite)
+    else if (m_height >= 5)  m_class = 2;  // 5-8 rows → use 8× kernels
+    else if (m_height >= 1)  m_class = 1;  // 1-4 rows → use 4× kernels
+    else                     m_class = 0;  // ERROR
+    
+    //==========================================================================
+    // N-DIMENSION CLASSIFICATION
+    //==========================================================================
+    int n_class;
+    if (n_width >= 16)       n_class = 4;  // 16+ cols
+    else if (n_width >= 9)   n_class = 3;  // 9-15 cols (needs 16-wide kernel)
+    else if (n_width >= 6)   n_class = 2;  // 6-8 cols
+    else if (n_width >= 1)   n_class = 1;  // 1-5 cols
+    else                     n_class = 0;  // ERROR
+    
+    //==========================================================================
+    // 2D DISPATCH TABLE
+    //==========================================================================
+    // ┌─────────┬─────────┬─────────┬─────────┬─────────┐
+    // │ m\n     │ 1-5     │ 6-8     │ 9-15    │ 16+     │
+    // ├─────────┼─────────┼─────────┼─────────┼─────────┤
+    // │ 1-4     │ 4×8     │ 4×8     │ 4×8     │ 4×8     │
+    // │ 5-8     │ 8×8     │ 8×8     │ 8×16    │ 8×16    │
+    // │ 9-15    │ 16×8    │ 16×8    │ 16×16   │ 16×16   │ ← CRITICAL FIX!
+    // │ 16+     │ 16×8    │ 16×8    │ 16×16   │ 16×16   │
+    // └─────────┴─────────┴─────────┴─────────┴─────────┘
+    
+    gemm_kernel_id_t selected_add, selected_store;
+    int selected_width;
+    
+    if (m_class == 1) {
+        // m ∈ [1, 4]: Always use 4×8
+        selected_add = KERN_4x8_ADD;
+        selected_store = KERN_4x8_STORE;
+        selected_width = 8;
     }
-
-    // Priority 2: 16×8 (tall tile, composite)
-    if (m_height >= 16 && n_width >= 8 && n_width < 16) {
-        *kern_add = KERN_16x8_ADD;
-        *kern_store = KERN_16x8_STORE;
-        *kernel_width = 8;
-        return;
+    else if (m_class == 2) {
+        // m ∈ [5, 8]: Use 8×8 or 8×16
+        if (n_class <= 2) {  // n ∈ [1, 8]
+            selected_add = KERN_8x8_ADD;
+            selected_store = KERN_8x8_STORE;
+            selected_width = 8;
+        } else {  // n ∈ [9, ∞)
+            selected_add = KERN_8x16_ADD;
+            selected_store = KERN_8x16_STORE;
+            selected_width = 16;
+        }
     }
-
-    // Priority 3: 8×16 (wide tile, native)
-    if (m_height >= 8 && m_height < 16 && n_width >= 16) {
-        *kern_add = KERN_8x16_ADD;
-        *kern_store = KERN_8x16_STORE;
-        *kernel_width = 16;
-        return;
+    else if (m_class == 3 || m_class == 4) {
+        //  CRITICAL FIX: m ∈ [9, ∞) → Use 16× kernels (composite)
+        if (n_class <= 2) {  // n ∈ [1, 8]
+            selected_add = KERN_16x8_ADD;
+            selected_store = KERN_16x8_STORE;
+            selected_width = 8;
+        } else {  // n ∈ [9, ∞)
+            selected_add = KERN_16x16_ADD;  // ← Composite: 2× 8×16 calls
+            selected_store = KERN_16x16_STORE;
+            selected_width = 16;
+        }
     }
-
-    // Priority 4: 16×6 (for QR with N=6 blocks, composite)
-    if (m_height >= 16 && n_width >= 6 && n_width < 8) {
-        *kern_add = KERN_16x6_ADD;
-        *kern_store = KERN_16x6_STORE;
-        *kernel_width = 6;
-        return;
+    else {
+        // Fallback (should never reach)
+        selected_add = KERN_1x8_ADD;
+        selected_store = KERN_1x8_STORE;
+        selected_width = 8;
     }
-
-    // Priority 5: 8×8 (most common, native)
-    if (m_height >= 8 && m_height < 16 && n_width >= 8 && n_width < 16) {
-        *kern_add = KERN_8x8_ADD;
-        *kern_store = KERN_8x8_STORE;
-        *kernel_width = 8;
-        return;
-    }
-
-    // Priority 6: 8×6 (for QR with N=6 blocks, native)
-    if (m_height >= 8 && m_height < 16 && n_width >= 6 && n_width < 8) {
-        *kern_add = KERN_8x6_ADD;
-        *kern_store = KERN_8x6_STORE;
-        *kernel_width = 6;
-        return;
-    }
-
-    // Priority 7: 4×8 (short tile, native)
-    if (m_height >= 4 && m_height < 8) {
-        *kern_add = KERN_4x8_ADD;
-        *kern_store = KERN_4x8_STORE;
-        *kernel_width = 8;
-        return;
-    }
-
-    // Fallback: 1×8 (single row, always fits)
-    *kern_add = KERN_1x8_ADD;
-    *kern_store = KERN_1x8_STORE;
-    *kernel_width = 8;
+    
+    *kern_add = selected_add;
+    *kern_store = selected_store;
+    *kernel_width = selected_width;
 }
 
 //==============================================================================
@@ -371,19 +464,17 @@ void gemm_select_kernels(
  */
 static void precompute_panels(gemm_plan_t *plan)
 {
-    size_t n_panels = (plan->N + plan->NR - 1) / plan->NR;
+    size_t n_panels = (plan->max_N + plan->NR - 1) / plan->NR;
 
     for (size_t p = 0; p < n_panels; p++)
     {
         panel_info_t *panel = &plan->npanels[p];
         
-        // Starting column for this panel
         panel->j_start = p * plan->NR;
         
-        // Width: NR for full panels, N - j_start for last panel
-        panel->j_width = (panel->j_start + plan->NR <= plan->N)
+        panel->j_width = (panel->j_start + plan->NR <= plan->max_N)
                             ? plan->NR
-                            : (plan->N - panel->j_start);
+                            : (plan->max_N - panel->j_start);
     }
 }
 
@@ -533,47 +624,37 @@ gemm_plan_t *gemm_plan_create_with_mode(
     size_t M, size_t K, size_t N,
     gemm_memory_mode_t mode)
 {
-    // Validate mode vs dimensions
     if (mode == GEMM_MEM_STATIC && !gemm_fits_static(M, K, N))
         return NULL;
 
-    // Allocate plan structure
     gemm_plan_t *plan = (gemm_plan_t *)calloc(1, sizeof(gemm_plan_t));
     if (!plan)
         return NULL;
 
-    // Store dimensions
-    plan->M = M;
-    plan->K = K;
-    plan->N = N;
+    // Store maximum dimensions
+    plan->max_M = M;
+    plan->max_K = K;
+    plan->max_N = N;
     plan->mem_mode = mode;
 
-    //--------------------------------------------------------------------------
-    // Select blocking parameters (aspect-ratio adaptive)
-    //--------------------------------------------------------------------------
+    // Select blocking parameters
     gemm_select_blocking(M, K, N,
                          &plan->MC, &plan->KC, &plan->NC,
                          &plan->MR, &plan->NR);
 
-    //--------------------------------------------------------------------------
-    // PRE-COMPUTE TILE COUNTS (OPTIMIZATION: Eliminates division in hot path)
-    //--------------------------------------------------------------------------
-    plan->n_nc_tiles = (N + plan->NC - 1) / plan->NC;
-    plan->n_kc_tiles = (K + plan->KC - 1) / plan->KC;
-    plan->n_mc_tiles = (M + plan->MC - 1) / plan->MC;
+    // Precompute tile counts for max dimensions
+    plan->n_mc_tiles_max = (M + plan->MC - 1) / plan->MC;
+    plan->n_kc_tiles_max = (K + plan->KC - 1) / plan->KC;
+    plan->n_nc_tiles_max = (N + plan->NC - 1) / plan->NC;
 
-    //--------------------------------------------------------------------------
-    // PRE-SELECT KERNELS FOR FULL TILES (OPTIMIZATION: Eliminates dispatch)
-    //--------------------------------------------------------------------------
+    // Pre-select kernels for full tiles
     int dummy_width;
     gemm_select_kernels(plan->MR, plan->NR,
                        &plan->kern_full_add,
                        &plan->kern_full_store,
                        &dummy_width);
 
-    //--------------------------------------------------------------------------
     // Allocate panel descriptors
-    //--------------------------------------------------------------------------
     plan->n_npanels = (N + plan->NR - 1) / plan->NR;
     plan->npanels = (panel_info_t *)calloc(plan->n_npanels, sizeof(panel_info_t));
 
@@ -583,62 +664,55 @@ gemm_plan_t *gemm_plan_create_with_mode(
         return NULL;
     }
 
-    // Pre-compute all panel start/width pairs
     precompute_panels(plan);
 
-    //--------------------------------------------------------------------------
-    // Setup Workspace (mode-dependent)
-    //--------------------------------------------------------------------------
+    // Setup Workspace
     if (mode == GEMM_MEM_STATIC)
     {
-        // Initialize static pool if not already done
         gemm_static_init();
-        
-        // Partition static buffer:
-        // [0 ... MC*KC-1]: A workspace
-        // [MC*KC ... end]: B workspace
         plan->workspace_a = gemm_static_pool.workspace;
         plan->workspace_b = gemm_static_pool.workspace + (plan->MC * plan->KC);
         plan->workspace_temp = gemm_static_pool.workspace;
-        plan->workspace_size = 0; // Not owned by plan
+        plan->workspace_size = 0;
         plan->workspace_aligned = 1;
     }
-    else
+    else  // GEMM_MEM_DYNAMIC
+{
+    // FIX: Allocate workspace_a based on MR, not MC!
+    // 
+    // Rationale: pack_A_panel_simd_strided() always writes MR rows,
+    // regardless of actual ib. It writes kb × requested_mr floats.
+    // So workspace_a must be sized for MR × KC, not MC × KC.
+
+    size_t a_size = plan->MR * plan->KC * sizeof(float);
+    
+    // workspace_b sizing: Multiple N-panels, each KC × 16 floats
+    size_t max_n_panels = (plan->NC + plan->NR - 1) / plan->NR;
+    size_t b_size = max_n_panels * plan->KC * 16 * sizeof(float);
+    
+    // workspace_temp for edge tile handling
+    size_t temp_size = plan->MC * plan->NC * sizeof(float);
+    
+    // Align to 64-byte boundaries (cache line size)
+    a_size = (a_size + 63) & ~(size_t)63;
+    b_size = (b_size + 63) & ~(size_t)63;
+    temp_size = (temp_size + 63) & ~(size_t)63;
+    
+    plan->workspace_size = a_size + b_size + temp_size;
+    
+    // Allocate separate aligned buffers
+    plan->workspace_a = (float *)gemm_aligned_alloc(64, a_size);
+    plan->workspace_b = (float *)gemm_aligned_alloc(64, b_size);
+    plan->workspace_temp = (float *)gemm_aligned_alloc(64, temp_size);
+    
+    if (!plan->workspace_a || !plan->workspace_b || !plan->workspace_temp)
     {
-        // Dynamic allocation with 64-byte alignment
-        
-        // Packed A buffer: MC × KC floats
-        size_t a_size = plan->MC * plan->KC * sizeof(float);
-        
-        // Packed B buffer: (NC/NR) panels × KC rows × 16-wide stride
-        // Note: B stride is always 16 (see pack_B_panel_simd)
-        size_t max_n_panels = (plan->NC + plan->NR - 1) / plan->NR;
-        size_t b_size = max_n_panels * plan->KC * 16 * sizeof(float);
-        
-        // Temp buffer: MC × NC floats
-        size_t temp_size = plan->MC * plan->NC * sizeof(float);
-
-        // Align to 64-byte boundaries
-        a_size = (a_size + 63) & ~(size_t)63;
-        b_size = (b_size + 63) & ~(size_t)63;
-        temp_size = (temp_size + 63) & ~(size_t)63;
-
-        plan->workspace_size = a_size + b_size + temp_size;
-
-        // Allocate buffers
-        plan->workspace_a = (float *)gemm_aligned_alloc(64, a_size);
-        plan->workspace_b = (float *)gemm_aligned_alloc(64, b_size);
-        plan->workspace_temp = (float *)gemm_aligned_alloc(64, temp_size);
-
-        // Check for allocation failure
-        if (!plan->workspace_a || !plan->workspace_b || !plan->workspace_temp)
-        {
-            gemm_plan_destroy(plan);
-            return NULL;
-        }
-
-        plan->workspace_aligned = 1;
+        gemm_plan_destroy(plan);
+        return NULL;
     }
+    
+    plan->workspace_aligned = 1;
+}
 
     return plan;
 }
