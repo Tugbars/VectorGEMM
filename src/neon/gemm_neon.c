@@ -26,44 +26,49 @@
 #include <string.h>
 
 //==============================================================================
-// AUTO-TUNED BLOCKING (Compile-time detection)
+// CORRECTED: AUTO-TUNED BLOCKING WITH WORKSPACE SAFETY
 //==============================================================================
 
-// Detect cache sizes (platform-specific, tune for your chip)
-#ifndef L1D_CACHE_SIZE
-  #if defined(__ARM_ARCH_8A__) // Cortex-A72/A76
-    #define L1D_CACHE_SIZE 32768
-    #define L2_CACHE_SIZE 524288
-  #else // Cortex-A53/A55
-    #define L1D_CACHE_SIZE 16384
-    #define L2_CACHE_SIZE 262144
-  #endif
-#endif
-
-// Micro-kernel dimensions (4×4 optimal for all NEON cores)
+// Micro-kernel dimensions
 #define GEMM_MR 4
 #define GEMM_NR 4
-
-// Auto-tuned blocking (derived from cache sizes)
-// L1 working set: Ap (MR × KC) + Bp (KC × NR) + C tile
-// Target: 80% of L1 for data, 20% for code
-#define GEMM_KC_TARGET ((L1D_CACHE_SIZE * 4) / (5 * (GEMM_MR + GEMM_NR) * 4))
-#define GEMM_KC ((GEMM_KC_TARGET + 31) & ~31) // Round to 32 for alignment
-
-#define GEMM_MC_TARGET ((L1D_CACHE_SIZE * 4) / (5 * GEMM_KC * 4))
-#define GEMM_MC ((GEMM_MC_TARGET + GEMM_MR - 1) & ~(GEMM_MR - 1)) // Round to MR
-
-#define GEMM_NC_TARGET (L2_CACHE_SIZE / (GEMM_KC * 4 + 1024))
-#define GEMM_NC ((GEMM_NC_TARGET + GEMM_NR - 1) & ~(GEMM_NR - 1)) // Round to NR
 
 // Workspace limits (compile-time maximum)
 #define GEMM_MAX_KC 512
 #define GEMM_MAX_MC 256
-#define GEMM_WORKSPACE_A_SIZE (GEMM_MAX_MC * GEMM_MAX_KC)
-#define GEMM_WORKSPACE_B_SIZE (GEMM_MAX_KC * 16)
 
-// Prefetch tuning
-#define GEMM_PREFETCH_DISTANCE 256 // Bytes (cache line × 4)
+// Calculate KC from L1 (unchanged)
+#define GEMM_KC_TARGET ((L1D_CACHE_SIZE * 4) / (5 * (GEMM_MR + GEMM_NR) * 4))
+#define GEMM_KC ((GEMM_KC_TARGET + 31) & ~31)
+
+// Calculate MC from L1 (with floor to prevent tiny values)
+#define GEMM_MC_TARGET ((L1D_CACHE_SIZE * 4) / (5 * GEMM_KC * 4))
+#define GEMM_MC_RAW ((GEMM_MC_TARGET + GEMM_MR - 1) & ~(GEMM_MR - 1))
+
+// ✅ FIX: Ensure MC is at least MR (prevents tiny values)
+#if GEMM_MC_RAW < GEMM_MR
+  #define GEMM_MC GEMM_MR
+#else
+  #define GEMM_MC GEMM_MC_RAW
+#endif
+
+// ✅ FIX: NC must be constrained by B workspace capacity
+// B workspace holds: n_panels × KC × NR floats
+// Maximum n_panels = GEMM_WORKSPACE_B_SIZE / (GEMM_MAX_KC × GEMM_NR)
+#define GEMM_WORKSPACE_B_SIZE (GEMM_MAX_KC * 64) // 64 columns = 16 panels
+
+#define GEMM_NC_FROM_L2 (L2_CACHE_SIZE / (GEMM_KC * 4 + 1024))
+#define GEMM_NC_FROM_WORKSPACE ((GEMM_WORKSPACE_B_SIZE / GEMM_MAX_KC) & ~(GEMM_NR - 1))
+
+// Use the smaller of L2-derived or workspace-constrained
+#if GEMM_NC_FROM_L2 > GEMM_NC_FROM_WORKSPACE
+  #define GEMM_NC GEMM_NC_FROM_WORKSPACE
+#else
+  #define GEMM_NC ((GEMM_NC_FROM_L2 + GEMM_NR - 1) & ~(GEMM_NR - 1))
+#endif
+
+// Workspace A sizing (unchanged)
+#define GEMM_WORKSPACE_A_SIZE (GEMM_MAX_MC * GEMM_MAX_KC)
 
 //==============================================================================
 // STATIC WORKSPACE (64-byte aligned for Cortex-A72/A76)
@@ -88,18 +93,27 @@ static float __attribute__((aligned(64)))
 //==============================================================================
 
 /**
- * @brief Pack A panel with interleaved layout for optimal L1 streaming
+ * @brief Pack A panel with K-major layout: Ap[k*MR + i] = A[i][k] * alpha
  * 
- * Layout: K-major with 4-element interleave
- * Before: A[i][k] (row-major)
- * After:  Ap[k/4][i][k%4] → contiguous 4×4 tiles
+ * CRITICAL: Kernel expects K-major layout for contiguous vector loads:
+ *   float32x4_t a = vld1q_f32(Ap + k * GEMM_MR);
  * 
- * Benefits:
- * - Micro-kernel loads 16 bytes stride-1 (L1 friendly)
- * - No cache line splits
- * - ~8% faster than naive layout on A72/A76
+ * Layout:
+ *   Ap[0..3]   = A[i0+0..i0+3][k0+0]  (K=0, all 4 rows)
+ *   Ap[4..7]   = A[i0+0..i0+3][k0+1]  (K=1, all 4 rows)
+ *   Ap[8..11]  = A[i0+0..i0+3][k0+2]  (K=2, all 4 rows)
+ *   ...
+ * 
+ * This is column-major in the K-dimension, allowing kernel to:
+ * - Load 4 rows at once with single vld1q_f32()
+ * - Increment pointer by MR per K-iteration
+ * 
+ * OPTIMIZATIONS:
+ * - Prefetching every 16 K-iterations
+ * - NEON gather for m_panel=4 (full width)
+ * - Pointer arithmetic (no index multiplies)
  */
-static inline void pack_A_interleaved_neon(
+static inline void pack_A_kmajor_neon(
     float * restrict Ap,
     const float * restrict A,
     size_t lda,
@@ -107,111 +121,131 @@ static inline void pack_A_interleaved_neon(
     size_t k0, size_t k_panel,
     float alpha)
 {
-    // Zero-fill outside inner loop (moved out per feedback)
-    const size_t pack_size = k_panel * GEMM_MR;
-    if (m_panel < GEMM_MR) {
-        memset(Ap, 0, pack_size * sizeof(float));
-    }
-
     const float *src_base = A + i0 * lda + k0;
     
+    // Zero-fill if partial panel (outside loop for efficiency)
+    if (m_panel < GEMM_MR) {
+        memset(Ap, 0, k_panel * GEMM_MR * sizeof(float));
+    }
+
+    float *dst_ptr = Ap;  // Pointer-chasing for output
+    
+    //==========================================================================
+    // FAST PATH: alpha = 1.0 (no scaling)
+    //==========================================================================
     if (alpha == 1.0f) {
-        // Fast path: No scaling, unrolled by 4
-        size_t k = 0;
-        for (; k + 3 < k_panel; k += 4) {
-            // Prefetch ahead during packing (feedback item 2C)
+        for (size_t k = 0; k < k_panel; ++k) {
+            // Prefetch ahead (every 16 iterations to avoid over-prefetching)
             if ((k & 15) == 0 && k + 16 < k_panel) {
                 PREFETCH_L1(src_base + 16);
             }
             
-            // Pack 4×4 tile (interleaved)
-            float *dst = Ap + k * GEMM_MR;
+            const float *src_col = src_base + k;  // Points to A[i0][k0+k]
             
-            // Gather 4 rows, 4 elements each
-            for (size_t i = 0; i < m_panel && i < GEMM_MR; ++i) {
-                const float *src = src_base + i * lda + k;
-                
-                // Load 4 consecutive K elements
-                float32x4_t row = vld1q_f32(src);
-                vst1q_f32(dst + i * 4, row);
+            if (m_panel == GEMM_MR) {
+                // Full width: NEON gather (4 strided loads)
+                // Build vector: {A[i0+0][k], A[i0+1][k], A[i0+2][k], A[i0+3][k]}
+                float32x4_t col;
+                col = vsetq_lane_f32(src_col[0 * lda], col, 0);
+                col = vsetq_lane_f32(src_col[1 * lda], col, 1);
+                col = vsetq_lane_f32(src_col[2 * lda], col, 2);
+                col = vsetq_lane_f32(src_col[3 * lda], col, 3);
+                vst1q_f32(dst_ptr, col);
+            } else {
+                // Partial width: Scalar gather with zero-fill
+                for (size_t i = 0; i < m_panel; ++i) {
+                    dst_ptr[i] = src_col[i * lda];
+                }
+                // Remaining elements already zeroed by memset
             }
+            
+            dst_ptr += GEMM_MR;  // Move to next K-iteration
         }
-        
-        // Tail: Remaining K iterations
-        for (; k < k_panel; ++k) {
-            float *dst = Ap + k * GEMM_MR;
-            for (size_t i = 0; i < m_panel && i < GEMM_MR; ++i) {
-                dst[i] = src_base[i * lda + k];
-            }
-        }
-    } else {
-        // With alpha scaling
+    }
+    //==========================================================================
+    // GENERAL PATH: alpha ≠ 1.0 (with scaling)
+    //==========================================================================
+    else {
         float32x4_t valpha = vdupq_n_f32(alpha);
         
-        size_t k = 0;
-        for (; k + 3 < k_panel; k += 4) {
+        for (size_t k = 0; k < k_panel; ++k) {
             if ((k & 15) == 0 && k + 16 < k_panel) {
                 PREFETCH_L1(src_base + 16);
             }
             
-            float *dst = Ap + k * GEMM_MR;
+            const float *src_col = src_base + k;
             
-            for (size_t i = 0; i < m_panel && i < GEMM_MR; ++i) {
-                const float *src = src_base + i * lda + k;
-                float32x4_t row = vld1q_f32(src);
-                row = vmulq_f32(row, valpha);
-                vst1q_f32(dst + i * 4, row);
+            if (m_panel == GEMM_MR) {
+                // Full width: NEON gather + scale
+                float32x4_t col;
+                col = vsetq_lane_f32(src_col[0 * lda], col, 0);
+                col = vsetq_lane_f32(src_col[1 * lda], col, 1);
+                col = vsetq_lane_f32(src_col[2 * lda], col, 2);
+                col = vsetq_lane_f32(src_col[3 * lda], col, 3);
+                col = vmulq_f32(col, valpha);
+                vst1q_f32(dst_ptr, col);
+            } else {
+                // Partial width: Scalar gather + scale
+                for (size_t i = 0; i < m_panel; ++i) {
+                    dst_ptr[i] = src_col[i * lda] * alpha;
+                }
             }
-        }
-        
-        for (; k < k_panel; ++k) {
-            float *dst = Ap + k * GEMM_MR;
-            for (size_t i = 0; i < m_panel && i < GEMM_MR; ++i) {
-                dst[i] = src_base[i * lda + k] * alpha;
-            }
+            
+            dst_ptr += GEMM_MR;
         }
     }
 }
 
 /**
- * @brief Pack B panel with broadcast-friendly layout
+ * @brief Pack B panel with row-major layout: Bp[k*NR + j] = B[k][j]
  * 
- * Layout: Each K-iteration stores [b0, b1, b2, b3] contiguously
- * Micro-kernel broadcasts directly from packed buffer
+ * Layout (unchanged, already correct):
+ *   Bp[0..3]   = B[k0+0][j0..j0+3]  (K=0, all 4 cols)
+ *   Bp[4..7]   = B[k0+1][j0..j0+3]  (K=1, all 4 cols)
+ *   ...
+ * 
+ * Kernel broadcasts from this: vdupq_n_f32(Bp[k*NR + j])
+ * 
+ * ✅ WORKSPACE SAFETY: Caller ensures n_panels * k_block * NR ≤ GEMM_WORKSPACE_B_SIZE
  */
-static inline void pack_B_interleaved_neon(
+static inline void pack_B_neon(
     float * restrict Bp,
     const float * restrict B,
     size_t ldb,
     size_t k0, size_t k_panel,
     size_t j0, size_t n_panel)
 {
+    // Zero-fill if partial panel
     if (n_panel < GEMM_NR) {
         memset(Bp, 0, k_panel * GEMM_NR * sizeof(float));
     }
 
     const float *src_base = B + k0 * ldb + j0;
+    float *dst_ptr = Bp;
     
     for (size_t k = 0; k < k_panel; ++k) {
-        // Prefetch during packing
+        // Prefetch during packing (every 8 iterations)
         if ((k & 7) == 0 && k + 8 < k_panel) {
             PREFETCH_L1(src_base + 8 * ldb);
         }
         
-        const float *src = src_base + k * ldb;
-        float *dst = Bp + k * GEMM_NR;
+        const float *src_row = src_base + k * ldb;
         
         if (n_panel == GEMM_NR) {
-            float32x4_t vec = vld1q_f32(src);
-            vst1q_f32(dst, vec);
+            // Full width: SIMD copy
+            float32x4_t vec = vld1q_f32(src_row);
+            vst1q_f32(dst_ptr, vec);
         } else {
-            // Partial width
+            // Partial width: Scalar copy
             for (size_t j = 0; j < n_panel; ++j) {
-                dst[j] = src[j];
+                dst_ptr[j] = src_row[j];
             }
         }
+        
+        dst_ptr += GEMM_NR;
     }
 }
+
 
 //==============================================================================
 // OPTIMIZED 4×4 MICRO-KERNEL (K-unrolled, pointer-chasing)
@@ -456,7 +490,7 @@ int gemm_embedded_neon_optimized(
                                  ? GEMM_NR : (jj + n_block - j);
                 
                 float *Bp_panel = Bp + p * k_block * GEMM_NR;
-                pack_B_interleaved_neon(Bp_panel, B, ldb, kk, k_block, 
+                pack_A_kmajor_neon(Bp_panel, B, ldb, kk, k_block, 
                                         j, n_panel);
             }
 
